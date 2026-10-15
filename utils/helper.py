@@ -140,6 +140,7 @@ def is_image_chat_request(body: dict[str, object]) -> bool:
 
 
 _UPSTREAM_BODY_LOG_LIMIT = 500
+_UPSTREAM_BODY_READ_LIMIT = 64 * 1024
 
 
 class UpstreamHTTPError(RuntimeError):
@@ -147,8 +148,8 @@ class UpstreamHTTPError(RuntimeError):
 
     Carries structured fields (status_code, body, retry_after) so callers can
     branch on status code instead of string-matching on str(exc). The full
-    body is preserved on the instance; the formatted message truncates it
-    to keep log lines reasonable.
+    body is preserved on the instance (bounded when read from a stream);
+    the formatted message truncates it to keep log lines reasonable.
     """
 
     def __init__(
@@ -177,11 +178,52 @@ class UpstreamHTTPError(RuntimeError):
 def ensure_ok(response: requests.Response, context: str) -> None:
     if 200 <= response.status_code < 300:
         return
-    body: Any = response.text
+    body: Any = ""
     try:
-        body = response.json()
-    except Exception:
-        pass
+        try:
+            body = response.text
+        except Exception:
+            pass
+        try:
+            body = response.json()
+        except Exception:
+            pass
+        # curl_cffi does not populate content/text for stream=True responses.
+        # Read only failed, unbuffered responses; successful SSE must stay intact.
+        if body == "" and callable(getattr(response, "iter_content", None)):
+            content = bytearray()
+            limited = False
+            try:
+                # Reads and close() retain the request's network timeout.
+                for chunk in response.iter_content():
+                    if chunk:
+                        content.extend(chunk[:_UPSTREAM_BODY_READ_LIMIT - len(content)])
+                    if len(content) >= _UPSTREAM_BODY_READ_LIMIT:
+                        limited = True
+                        break
+            except Exception:
+                # Preserve the HTTP status and any partial body if reading fails
+                # (including a non-streaming response with an empty body).
+                pass
+            if content:
+                try:
+                    body = json.loads(content)
+                except (ValueError, UnicodeDecodeError):
+                    encoding = getattr(response, "encoding", None) or "utf-8"
+                    try:
+                        body = content.decode(encoding, errors="replace")
+                    except (LookupError, TypeError):
+                        body = content.decode("utf-8", errors="replace")
+                    if limited:
+                        body += "…[truncated]"
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                # Cleanup must not hide the upstream HTTP error.
+                pass
     retry_after_header = response.headers.get("Retry-After") if hasattr(response, "headers") else None
     retry_after: int | None = None
     if retry_after_header is not None:

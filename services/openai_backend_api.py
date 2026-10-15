@@ -25,6 +25,8 @@ from services.proxy_service import proxy_settings
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
+from utils.browser_turnstile import BrowserTurnstileError, solve_browser_turnstile
+from utils.browser_fingerprint import browser_fingerprint
 from utils.turnstile import solve_turnstile_token
 
 
@@ -183,12 +185,9 @@ class OpenAIBackendAPI:
             "Sec-Ch-Ua": self.fp["sec-ch-ua"],
             "Sec-Ch-Ua-Arch": '"x86"',
             "Sec-Ch-Ua-Bitness": '"64"',
-            "Sec-Ch-Ua-Full-Version": '"143.0.3650.96"',
-            "Sec-Ch-Ua-Full-Version-List": '"Microsoft Edge";v="143.0.3650.96", "Chromium";v="143.0.7499.147", "Not A(Brand";v="24.0.0.0"',
             "Sec-Ch-Ua-Mobile": self.fp["sec-ch-ua-mobile"],
             "Sec-Ch-Ua-Model": '""',
             "Sec-Ch-Ua-Platform": self.fp["sec-ch-ua-platform"],
-            "Sec-Ch-Ua-Platform-Version": '"19.0.0"',
             "Sec-Fetch-Dest": "empty",
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
@@ -225,7 +224,10 @@ class OpenAIBackendAPI:
     def _build_fp(self) -> Dict[str, str]:
         account = self.account
         raw_fp = account.get("fp")
-        fp = {str(k).lower(): str(v) for k, v in raw_fp.items()} if isinstance(raw_fp, dict) else {}
+        fp = {
+            str(k).lower(): str(v).strip() for k, v in raw_fp.items()
+            if v is not None and str(v).strip()
+        } if isinstance(raw_fp, dict) else {}
         for key in (
                 "user-agent",
                 "impersonate",
@@ -238,17 +240,23 @@ class OpenAIBackendAPI:
             value = str(account.get(key) or "").strip()
             if value:
                 fp[key] = value
+        if os.getenv("CHATGPT2API_TURNSTILE_SOLVER", "legacy").strip().lower() == "browser":
+            # The VM can observe Chromium's real version through UAData. A
+            # fixed old UA disagrees with it even when new_context overrides UA.
+            if not fp.get("user-agent"):
+                for key, value in browser_fingerprint().items():
+                    fp.setdefault(key, value)
         fp.setdefault(
             "user-agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
         )
-        fp.setdefault("impersonate", "chrome110")
+        fp.setdefault("impersonate", "chrome146")
         fp.setdefault("oai-device-id", new_uuid())
         fp.setdefault("oai-session-id", new_uuid())
-        fp.setdefault("sec-ch-ua", '"Microsoft Edge";v="143", "Chromium";v="143", "Not A(Brand";v="24"')
+        fp.setdefault("sec-ch-ua", '"Chromium";v="146"')
         fp.setdefault("sec-ch-ua-mobile", "?0")
-        fp.setdefault("sec-ch-ua-platform", '"Windows"')
+        fp.setdefault("sec-ch-ua-platform", '"Linux"')
         return fp
 
     def _headers(self, path: str, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -379,6 +387,35 @@ class OpenAIBackendAPI:
             "Upgrade-Insecure-Requests": "1",
         }
 
+    def _required_turnstile_token(self, data: Dict[str, Any], source_p: str) -> str:
+        turnstile_info = data.get("turnstile") or {}
+        if not turnstile_info.get("required"):
+            return ""
+        challenge = turnstile_info.get("dx")
+        if not isinstance(challenge, str) or not challenge.strip():
+            raise RuntimeError("chat requirements requires turnstile token, but challenge is missing")
+        solver = os.getenv("CHATGPT2API_TURNSTILE_SOLVER", "legacy").strip().lower()
+        if solver not in {"legacy", "browser"}:
+            raise RuntimeError("CHATGPT2API_TURNSTILE_SOLVER must be legacy or browser")
+        try:
+            if solver == "browser":
+                token = solve_browser_turnstile(challenge, source_p, self.user_agent)
+            else:
+                token = solve_turnstile_token(challenge, source_p)
+        except BrowserTurnstileError as exc:
+            raise RuntimeError(
+                f"{exc} See docs/conversation-404.md for browser configuration."
+            ) from None
+        except Exception:
+            # Do not include challenge contents or solver exception details.
+            raise RuntimeError("chat requirements requires turnstile token, but challenge could not be solved") from None
+        if not isinstance(token, str) or not token.strip():
+            raise RuntimeError(
+                "chat requirements requires turnstile token, but challenge could not be solved; "
+                "enable CHATGPT2API_TURNSTILE_SOLVER=browser (see docs/conversation-404.md)"
+            )
+        return token
+
     def _build_requirements(self, data: Dict[str, Any], source_p: str = "") -> ChatRequirements:
         """把 sentinel 响应整理成后续对话需要的 token 集合。"""
         if (data.get("arkose") or {}).get("required"):
@@ -395,10 +432,7 @@ class OpenAIBackendAPI:
                 data_build=self.pow_data_build,
             )
 
-        turnstile_token = ""
-        turnstile_info = data.get("turnstile") or {}
-        if turnstile_info.get("required") and turnstile_info.get("dx"):
-            turnstile_token = solve_turnstile_token(turnstile_info["dx"], source_p) or ""
+        turnstile_token = self._required_turnstile_token(data, source_p)
 
         return ChatRequirements(
             token=data.get("token", ""),
@@ -555,7 +589,8 @@ class OpenAIBackendAPI:
         if not base_model:
             return "auto"
         if base_model == "gpt-image-2":
-            return "gpt-5-3"
+            default_model = self.account.get("default_model_slug")
+            return default_model.strip() if isinstance(default_model, str) and default_model.strip() else "auto"
         if base_model == CODEX_IMAGE_MODEL:
             return base_model
         return "auto"
@@ -570,6 +605,10 @@ class OpenAIBackendAPI:
         }
         if requirements.proof_token:
             headers["OpenAI-Sentinel-Proof-Token"] = requirements.proof_token
+        if requirements.turnstile_token:
+            headers["OpenAI-Sentinel-Turnstile-Token"] = requirements.turnstile_token
+        if requirements.so_token:
+            headers["OpenAI-Sentinel-SO-Token"] = requirements.so_token
         if conduit_token:
             headers["X-Conduit-Token"] = conduit_token
         if accept == "text/event-stream":
@@ -850,7 +889,7 @@ class OpenAIBackendAPI:
         payload = {
             "action": "next",
             "fork_from_shared_post": False,
-            "parent_message_id": new_uuid(),
+            "parent_message_id": "client-created-root",
             "model": self._image_model_slug(model),
             "client_prepare_state": "success",
             "timezone_offset_min": -480,
@@ -988,7 +1027,7 @@ class OpenAIBackendAPI:
                 "content": content,
                 "metadata": metadata,
             }],
-            "parent_message_id": new_uuid(),
+            "parent_message_id": "client-created-root",
             "model": self._image_model_slug(model),
             "client_prepare_state": "sent",
             "timezone_offset_min": -480,
@@ -2637,10 +2676,7 @@ class OpenAIBackendAPI:
                 data_build=self.pow_data_build,
             )
 
-        turnstile_token = ""
-        turnstile_info = prepare_data.get("turnstile") or {}
-        if turnstile_info.get("required") and turnstile_info.get("dx"):
-            turnstile_token = solve_turnstile_token(turnstile_info["dx"], p_token) or ""
+        turnstile_token = self._required_turnstile_token(prepare_data, p_token)
 
         finalize_path = base + "/finalize"
         response = self.session.post(
@@ -2648,8 +2684,8 @@ class OpenAIBackendAPI:
             headers=self._headers(finalize_path, {"Content-Type": "application/json"}),
             json={
                 "prepare_token": prepare_data.get("prepare_token", ""),
-                "proof_token": proof_token,
-                "turnstile_token": turnstile_token,
+                "proofofwork": proof_token,
+                "turnstile": turnstile_token,
             },
             timeout=30,
         )

@@ -17,6 +17,8 @@
 
 ## 快速开始
 
+如果遇到 `/backend-api/f/conversation` 返回 404 或必需的 Turnstile 校验失败，参见 [会话兼容修复与本地浏览器配置](docs/conversation-404.md)。该修复需要启用本地浏览器求解器。
+
 ### Docker 运行
 
 ```bash

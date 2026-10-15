@@ -19,6 +19,7 @@ FROM --platform=$TARGETPLATFORM python:3.13-slim AS app
 
 ARG TARGETPLATFORM
 ARG TARGETARCH
+ARG INSTALL_BROWSER_SOLVER=false
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -40,7 +41,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install --no-cache-dir uv
 
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --no-install-project
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
+RUN if [ "$INSTALL_BROWSER_SOLVER" = "true" ]; then \
+      uv sync --frozen --no-dev --group browser --no-install-project && \
+      .venv/bin/python -m playwright install --with-deps chromium; \
+    else \
+      uv sync --frozen --no-dev --no-install-project; \
+    fi
 
 COPY main.py ./
 COPY config.json ./
@@ -48,9 +55,10 @@ COPY VERSION ./
 COPY api ./api
 COPY services ./services
 COPY utils ./utils
+COPY docs/conversation-404.md ./docs/conversation-404.md
 COPY scripts ./scripts
 COPY --from=web-build /app/web/out ./web_dist
 
 EXPOSE 80
 
-CMD ["uv", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80", "--access-log"]
+CMD ["uv", "run", "--no-sync", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80", "--access-log"]

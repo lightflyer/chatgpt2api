@@ -1,4 +1,3 @@
-import hashlib
 import json
 import random
 import re
@@ -165,19 +164,39 @@ def build_pow_config(
     ]
 
 
+def _sentinel_hash(value: str) -> str:
+    """Match the current web client's 32-bit hash, including JS UTF-16 units."""
+    digest = 2166136261
+    for char in value:
+        unit = ord(char)
+        if unit > 0xFFFF:
+            # JavaScript charCodeAt visits each surrogate of an astral character.
+            unit -= 0x10000
+            digest = ((digest ^ (0xD800 + (unit >> 10))) * 16777619) & 0xFFFFFFFF
+            unit = 0xDC00 + (unit & 0x3FF)
+        digest = ((digest ^ unit) * 16777619) & 0xFFFFFFFF
+    digest ^= digest >> 16
+    digest = (digest * 2246822507) & 0xFFFFFFFF
+    digest ^= digest >> 13
+    digest = (digest * 3266489909) & 0xFFFFFFFF
+    digest ^= digest >> 16
+    return f"{digest:08x}"
+
+
 def _pow_generate(seed: str, difficulty: str, config: list[Any], limit: int = 500000) -> tuple[str, bool]:
-    target = bytes.fromhex(difficulty)
-    diff_len = len(difficulty) // 2
-    seed_bytes = seed.encode()
+    # The current Sentinel SDK uses this hash and the ~S answer format, rather
+    # than the old SHA3 byte comparison. Compare hex characters so odd lengths
+    # have the same meaning as JavaScript substring(0, difficulty.length).
+    started = time.perf_counter()
     static_1 = (json.dumps(config[:3], separators=(",", ":"), ensure_ascii=False)[:-1] + ",").encode()
     static_2 = ("," + json.dumps(config[4:9], separators=(",", ":"), ensure_ascii=False)[1:-1] + ",").encode()
     static_3 = ("," + json.dumps(config[10:], separators=(",", ":"), ensure_ascii=False)[1:]).encode()
     for i in range(limit):
-        final_json = static_1 + str(i).encode() + static_2 + str(i >> 1).encode() + static_3
-        encoded = pybase64.b64encode(final_json)
-        digest = hashlib.sha3_512(seed_bytes + encoded).digest()
-        if digest[:diff_len] <= target:
-            return encoded.decode(), True
+        elapsed_ms = int((time.perf_counter() - started) * 1000 + 0.5)
+        final_json = static_1 + str(i).encode() + static_2 + str(elapsed_ms).encode() + static_3
+        encoded = pybase64.b64encode(final_json).decode()
+        if _sentinel_hash(seed + encoded)[:len(difficulty)] <= difficulty:
+            return encoded + "~S", True
     fallback = "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D" + pybase64.b64encode(f'"{seed}"'.encode()).decode()
     return fallback, False
 
