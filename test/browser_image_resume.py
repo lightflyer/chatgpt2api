@@ -9,6 +9,8 @@ from urllib.parse import urlparse,parse_qs
 from playwright.async_api import async_playwright
 
 BASE=os.environ.get('CHATGPT2API_UI_BASE_URL', 'http://127.0.0.1:3001').rstrip('/')
+TERMINAL_TEXT=os.environ.get('CHATGPT2API_UI_TERMINAL_TEXT_FIXTURE')=='1'
+TEXT_REPLY='ChatGPT 未生成图片，回复：请上传需要修改的原图'
 async def main():
     async with async_playwright() as p:
         options={'headless':True,'chromium_sandbox':os.environ.get('CHATGPT2API_BROWSER_NO_SANDBOX')!='1'}
@@ -38,7 +40,7 @@ async def main():
                         if polls[task_id]>=2:state[task_id]='success'
                     status=state.get(task_id,'error')
                     item={'id':task_id,'status':status,'mode':'edit','conversation_id':'upstream-'+task_id,'data':[]}
-                    if status=='error':item['error']='ChatGPT 生图超时（已等待 120 秒）'
+                    if status=='error':item['error']=TEXT_REPLY if TERMINAL_TEXT and task_id=='task-clicked' else 'ChatGPT 生图超时（已等待 120 秒）'
                     if status=='success':item['data']=[{'url':BASE+'/images/result-'+task_id+'.png'}]
                     items.append(item)
                 data={'items':items,'missing_ids':[]}
@@ -60,6 +62,14 @@ async def main():
         await page.get_by_role('button',name='继续等待',exact=True).first.wait_for(timeout=20000)
         await page.reload(wait_until='networkidle')
         await page.get_by_role('button',name='继续等待',exact=True).first.click()
+        if TERMINAL_TEXT:
+            await page.get_by_text(TEXT_REPLY,exact=True).wait_for(timeout=20000)
+            assert calls==[],calls
+            assert await page.get_by_role('button',name='继续等待',exact=True).count()==1
+            assert not errors,errors
+            print(json.dumps({'success':True,'stale_timeout_updated_to_text_reply':True,'resume_requests':0,'generation_requests':0,'browser_errors':errors},ensure_ascii=False))
+            await browser.close()
+            return
         result=page.locator('img[src$="result-task-clicked.png"]')
         await result.first.wait_for(timeout=20000)
         await page.wait_for_function("Array.from(document.images).some(i=>i.src.endsWith('result-task-clicked.png')&&i.complete&&i.naturalWidth>0)")

@@ -1421,7 +1421,12 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       return;
     }
     try {
-      const resumed = await resumeImagePoll(taskId, imageTimeoutRetrySecs);
+      // Another browser or an earlier check may already have resolved this task.
+      const snapshot = await fetchImageTasks([taskId]);
+      const existing = snapshot.items.find((task) => task.id === taskId);
+      const canResume = existing?.status === "error" &&
+        (existing.error?.includes("超时") || existing.error?.includes("proxy_url"));
+      const resumed = existing && !canResume ? existing : await resumeImagePoll(taskId, imageTimeoutRetrySecs);
       await updateConversation(conversation.id, (current) => {
         const value = current ?? conversation;
         return {
