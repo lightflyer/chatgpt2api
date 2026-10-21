@@ -22,6 +22,8 @@ async def check(browser, case, count=1):
     calls, errors = [], []
     submitted = asyncio.Event()
     page.on("pageerror", lambda error: errors.append(str(error)))
+    await page.add_init_script("""window.__imageFetches=[]; const originalFetch=window.fetch;
+        window.fetch=function(input,...args){window.__imageFetches.push(String(input));return originalFetch.call(this,input,...args);};""")
 
     async def route_handler(route):
         request = route.request
@@ -86,7 +88,7 @@ async def check(browser, case, count=1):
         }); db.close();
         localStorage.setItem('chatgpt2api:image_active_conversation_id','context-conversation');
         localStorage.setItem('chatgpt2api:image_last_count','1');
-    }""", {"base": BASE, "count": count})
+    }""", {"base": BASE.replace("https:", "http:") if case == "legacy-http" else BASE, "count": count})
     await page.goto(BASE + "/image", wait_until="networkidle")
     await page.locator("textarea").wait_for()
     if case == "restored":
@@ -121,6 +123,9 @@ async def check(browser, case, count=1):
             assert len(calls[0]["files"]) == 1 and calls[0]["correct_image_bytes"], calls
         if case == "manual":
             assert calls[0]["files"] == ["manual.png"], calls
+        if case == "legacy-http" and BASE.startswith("https:"):
+            image_fetches = await page.evaluate("window.__imageFetches.filter(url=>url.includes('/images/context-fixture-'))")
+            assert image_fetches and all(url.startswith(BASE + "/") for url in image_fetches), image_fetches
     assert errors == [], errors
     await context.close()
     return {"case": case, "passed": True, "submitted": calls}
@@ -133,7 +138,7 @@ async def main():
             options["executable_path"] = os.environ["CHATGPT2API_BROWSER_EXECUTABLE"]
         browser = await playwright.chromium.launch(**options)
         results = []
-        for case in ("restored", "independent", "manual", "batch-selected", "batch-independent", "unavailable"):
+        for case in ("restored", "independent", "manual", "batch-selected", "batch-independent", "unavailable", "legacy-http"):
             results.append(await check(browser, case, 2 if case.startswith("batch-") else 1))
         await browser.close()
         print(json.dumps({"success": True, "cases": results}, ensure_ascii=False))

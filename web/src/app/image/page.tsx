@@ -181,8 +181,16 @@ function previousSingleResult(conversation: ImageConversation | null): StoredIma
   return null;
 }
 
+function browserImageUrl(url: string) {
+  const resolved = new URL(url, window.location.href);
+  if (window.location.protocol === "https:" && resolved.protocol === "http:" && resolved.host === window.location.host) {
+    resolved.protocol = "https:";
+  }
+  return resolved.href;
+}
+
 async function fetchImageAsFile(url: string, fileName: string) {
-  const response = await fetch(url);
+  const response = await fetch(browserImageUrl(url));
   if (!response.ok) {
     throw new Error("读取结果图失败");
   }
@@ -496,7 +504,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   const previousImageKey = previousImage ? `${selectedConversationId}:${previousImage.id}` : null;
   const inheritedImage = referenceImages.length === 0 && previousImageKey !== dismissedPreviousImage ? previousImage : null;
   const composerReferenceImages = inheritedImage
-    ? [{ name: "上一张结果图.png", dataUrl: inheritedImage.b64_json ? `data:image/png;base64,${inheritedImage.b64_json}` : inheritedImage.url! }]
+    ? [{ name: "上一张结果图.png", dataUrl: inheritedImage.b64_json ? `data:image/png;base64,${inheritedImage.b64_json}` : browserImageUrl(inheritedImage.url!) }]
     : referenceImages;
   const activeTaskCount = useMemo(
     () =>

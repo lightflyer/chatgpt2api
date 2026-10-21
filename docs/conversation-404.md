@@ -19,6 +19,8 @@ CHATGPT2API_UI_BASE_URL=http://127.0.0.1:3001 .venv/bin/python test/browser_imag
 
 浏览器测试覆盖刷新后的上一张编辑、独立生图、手动上传、多图选图和图片读取失败。API 全部模拟，不使用真实账号。
 
+HTTPS 页面读取本站旧的 HTTP 图片地址时会先升级为 HTTPS，避免旧结果因混合内容限制而无法加入编辑。生产部署应同时设置 `CHATGPT2API_BASE_URL=https://你的域名`，让新生成结果直接返回正确的公开地址。
+
 ## 慢速图生图与超时补取（2026-10-21）
 
 双参考图编辑可能需要 4～5 分钟。默认 `image_poll_timeout_secs` 现为 600 秒；已存在的挂载配置需要把原来的 120 显式改为 600。单账号并发 `image_account_concurrency` 保持 3。
