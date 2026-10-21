@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import threading
 import time
@@ -9,9 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from services.config import DATA_DIR, config
+from services.account_service import account_service
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
+from utils.helper import UpstreamHTTPError
 
 TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_RUNNING = "running"
@@ -59,6 +62,38 @@ def _collect_image_urls(data: list[Any]) -> list[str]:
             if isinstance(url, str) and url:
                 urls.append(url)
     return urls
+
+
+def _legacy_resume_error(error: str) -> bool:
+    return "proxy_url" in error and (
+        "has no attribute" in error or "unexpected keyword argument" in error
+    )
+
+
+def _resume_backend(conversation_id: str, account_email: str):
+    """Find the authenticated owner of an existing conversation, without generating."""
+    from services.openai_backend_api import OpenAIBackendAPI
+
+    accounts = [
+        item for item in account_service.list_accounts()
+        if item.get("access_token") and item.get("status") != "禁用"
+        and str(item.get("source_type") or "chatgpt").lower() != "codex"
+        and (not account_email or _clean(item.get("email")) == account_email)
+    ]
+    for account in accounts:
+        token = str(account["access_token"])
+        token = account_service.refresh_access_token(token, event="image_resume_poll") or token
+        backend = OpenAIBackendAPI(token)
+        try:
+            return backend, backend._get_conversation(conversation_id)
+        except UpstreamHTTPError as exc:
+            backend.close()
+            if exc.status_code not in {401, 403, 404}:
+                raise
+        except Exception:
+            backend.close()
+            raise
+    raise RuntimeError("无法使用原账号读取该图片会话，请检查号池中的账号是否仍可用")
 
 
 def _public_task(task: dict[str, Any]) -> dict[str, Any]:
@@ -293,6 +328,7 @@ class ImageTaskService:
             duration_ms = int((time.time() - started) * 1000)
             self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[],
                               duration_ms=duration_ms,
+                              **({"account_email": account_email} if account_email else {}),
                               **({"conversation_id": conversation_id} if conversation_id else {}))
             self._log_call(
                 identity,
@@ -399,6 +435,11 @@ class ImageTaskService:
             if isinstance(usage, dict):
                 task["usage"] = usage
             error = _clean(item.get("error"))
+            for field in ("conversation_id", "account_email"):
+                if value := _clean(item.get(field)):
+                    task[field] = value
+            if task.get("conversation_id") and _legacy_resume_error(error):
+                error = "超时任务补取失败，可继续等待：" + error
             if error:
                 task["error"] = error
             tasks[_task_key(owner, task_id)] = task
@@ -440,6 +481,8 @@ class ImageTaskService:
         identity: dict[str, object],
         task_id: str,
         extra_timeout_secs: float = 30.0,
+        *,
+        base_url: str = "",
     ) -> dict[str, Any]:
         """恢复对已超时任务的轮询，额外等待 extra_timeout_secs 秒。"""
         owner = _owner_id(identity)
@@ -448,10 +491,12 @@ class ImageTaskService:
             task = self._tasks.get(key)
             if task is None:
                 raise ValueError("task not found")
+            if task.get("status") in {TASK_STATUS_RUNNING, TASK_STATUS_SUCCESS}:
+                return _public_task(task)
             if task.get("status") != TASK_STATUS_ERROR:
                 raise ValueError("task is not in error state")
             error_msg = _clean(task.get("error"))
-            if "超时" not in error_msg:
+            if "超时" not in error_msg and not _legacy_resume_error(error_msg):
                 raise ValueError("task error is not a timeout error")
             conversation_id = _clean(task.get("conversation_id"))
             if not conversation_id:
@@ -459,12 +504,13 @@ class ImageTaskService:
             mode = task.get("mode", "generate")
             model = task.get("model", "gpt-image-2")
             # 将任务状态重置为 running
-            self._update_task(key, status=TASK_STATUS_RUNNING, error="")
+            self._update_task(key, status=TASK_STATUS_RUNNING, error="", progress="generating",
+                              started_ts=time.time(), duration_ms=None)
 
         # 启动新线程继续轮询
         thread = threading.Thread(
             target=self._run_resume_poll,
-            args=(key, conversation_id, extra_timeout_secs, dict(identity), mode, model),
+            args=(key, conversation_id, extra_timeout_secs, dict(identity), mode, model, base_url),
             name=f"image-resume-{_clean(task_id)[:16]}",
             daemon=True,
         )
@@ -479,19 +525,24 @@ class ImageTaskService:
         identity: dict[str, object],
         mode: str,
         model: str,
+        base_url: str = "",
     ) -> None:
         """后台线程：继续轮询已有 conversation_id 的图片结果。"""
         started = time.time()
         backend = None
         try:
-            from services.openai_backend_api import OpenAIBackendAPI
             from services.protocol.conversation import format_image_result
 
-            backend = OpenAIBackendAPI(proxy_url=config.proxy_url or None)
-            file_ids, sediment_ids = backend._poll_image_results(
-                conversation_id,
-                extra_timeout_secs,
-            )
+            with self._lock:
+                account_email = _clean((self._tasks.get(key) or {}).get("account_email"))
+            backend, conversation = _resume_backend(conversation_id, account_email)
+            file_ids: list[str] = []
+            sediment_ids: list[str] = []
+            for record in backend._extract_image_tool_records(conversation):
+                backend._add_unique(file_ids, record["file_ids"])
+                backend._add_unique(sediment_ids, record["sediment_ids"])
+            if not file_ids and not sediment_ids:
+                file_ids, sediment_ids = backend._poll_image_results(conversation_id, extra_timeout_secs)
             if not file_ids and not sediment_ids:
                 raise RuntimeError(
                     f"继续等待 {extra_timeout_secs} 秒后仍未找到图片结果。"
@@ -503,20 +554,18 @@ class ImageTaskService:
             if not image_urls:
                 raise RuntimeError("图片 URL 解析失败")
 
+            self._update_task(key, progress="receiving_image")
             image_items = [
-                {"b64_json": __import__("base64").b64encode(image_data).decode("ascii")}
+                {"b64_json": base64.b64encode(image_data).decode("ascii")}
                 for image_data in backend.download_image_bytes(image_urls)
             ]
-            # 获取 task 的原始 prompt（从 _public_task 的 mode 判断）
-            with self._lock:
-                task = self._tasks.get(key)
-                quality = _clean(task.get("quality"), "auto") if task else "auto"
-                size = _clean(task.get("size")) if task else None
+            if not image_items:
+                raise RuntimeError("原会话没有可下载的图片结果")
             data = format_image_result(
                 image_items,
                 "",  # prompt 已不重要，结果已经拿到了
-                "b64_json",
-                "",
+                "url",
+                base_url or None,
                 int(time.time()),
             )["data"]
             self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, error="", duration_ms=int((time.time() - started) * 1000))
@@ -530,7 +579,7 @@ class ImageTaskService:
                 urls=_collect_image_urls(data),
             )
         except Exception as exc:
-            error_message = str(exc) or "resume poll failed"
+            error_message = "超时任务补取失败：" + (str(exc) or "resume poll failed")
             duration_ms = int((time.time() - started) * 1000)
             self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[], duration_ms=duration_ms)
             self._log_call(

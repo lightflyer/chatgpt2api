@@ -19,6 +19,11 @@ class FakeImageTaskService:
     def __init__(self):
         self.generation_calls = []
         self.edit_calls = []
+        self.resume_calls = []
+
+    def resume_poll(self, identity, task_id, extra_timeout_secs, **kwargs):
+        self.resume_calls.append((identity, task_id, extra_timeout_secs, kwargs))
+        return {"id": task_id, "status": "running", "mode": "edit"}
 
     def submit_generation(self, identity, **kwargs):
         self.generation_calls.append((identity, kwargs))
@@ -125,6 +130,17 @@ class ImageTasksApiTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual([item["id"] for item in payload["items"]], ["task-1"])
         self.assertEqual(payload["missing_ids"], ["missing"])
+
+    def test_resume_existing_task_passes_public_base_url(self):
+        response = self.client.post(
+            "/api/image-tasks/old-edit/resume-poll", headers=AUTH_HEADERS,
+            json={"extra_timeout_secs": 30},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "running")
+        _, task_id, timeout, options = self.fake_service.resume_calls[0]
+        self.assertEqual((task_id, timeout), ("old-edit", 30))
+        self.assertEqual(options["base_url"], "http://testserver")
 
 
 if __name__ == "__main__":

@@ -2144,7 +2144,7 @@ class OpenAIBackendAPI:
     def _poll_image_results(
             self,
             conversation_id: str,
-            timeout_secs: float = 120.0,
+            timeout_secs: float = 600.0,
             initial_file_ids: list[str] | None = None,
             initial_sediment_ids: list[str] | None = None,
     ) -> tuple[list[str], list[str]]:

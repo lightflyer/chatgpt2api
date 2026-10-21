@@ -395,9 +395,9 @@ class ConfigStore:
     @property
     def image_poll_timeout_secs(self) -> int:
         try:
-            return max(1, int(self.data.get("image_poll_timeout_secs", 120)))
+            return max(1, int(self.data.get("image_poll_timeout_secs", 600)))
         except (TypeError, ValueError):
-            return 120
+            return 600
 
     @property
     def image_poll_interval_secs(self) -> float:

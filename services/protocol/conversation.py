@@ -1343,6 +1343,10 @@ def _generate_single_image(
             account_service.mark_image_result(token, False)
             if account_email:
                 setattr(exc, "account_email", account_email)
+            # An accepted conversation can finish after the local wait budget.
+            # Preserve it for resume-poll instead of submitting another image.
+            if getattr(exc, "conversation_id", ""):
+                raise
             # 轮询超时：换账号重试
             if not emitted_for_token:
                 poll_timeout_retry_count += 1
