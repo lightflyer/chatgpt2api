@@ -471,11 +471,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     | { type: "all" }
     | null
   >(null);
-  const [timeoutRetry, setTimeoutRetry] = useState<{
-    conversationId: string;
-    taskId: string;
-    taskError: string;
-  } | null>(null);
+
 
   const parsedCount = useMemo(() => Number(clampImageCount(imageCount)), [imageCount]);
   const selectedConversation = useMemo(
@@ -1205,23 +1201,24 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         const referenceFiles = activeTurn.referenceImages.map((image, index) =>
           dataUrlToFile(image.dataUrl, image.name || `${activeTurn.id}-${index + 1}.png`, image.type),
         );
-        if (activeTurn.mode === "edit" && referenceFiles.length === 0) {
+        const pendingImages = activeTurn.images.filter((image) => image.status === "loading");
+        const existing = await fetchImageTasks(pendingImages.map((image) => image.taskId || image.id));
+        const existingIds = new Set(existing.items.map((task) => task.id));
+        const unsubmitted = pendingImages.filter((image) => !existingIds.has(image.taskId || image.id));
+        if (unsubmitted.length > 0 && activeTurn.mode === "edit" && referenceFiles.length === 0) {
           throw new Error("未找到可用于继续编辑的参考图");
         }
-
-        const pendingImages = activeTurn.images.filter((image) => image.status === "loading");
         const submitted = await Promise.all(
-          pendingImages.map((image) => {
+          unsubmitted.map((image) => {
             const taskId = image.taskId || image.id;
             return activeTurn.mode === "edit"
               ? createImageEditTask(taskId, referenceFiles, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality)
               : createImageGenerationTask(taskId, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality);
           }),
         );
-        await applyTasks(submitted);
+        await applyTasks([...existing.items, ...submitted]);
 
         let consecutiveErrors = 0;
-        const retryingTaskIdsRef = new Set<string>();
         while (true) {
           const latestConversation = conversationsRef.current.find((conversation) => conversation.id === conversationId);
           const latestTurn = latestConversation?.turns.find((turn) => turn.id === activeTurn.id);
@@ -1238,26 +1235,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
             const taskList = await fetchImageTasks(loadingTaskIds);
             consecutiveErrors = 0;
             if (taskList.items.length > 0) {
-              // 检测是否有超时错误且需要显示重试按钮
-              const timeoutTask = taskList.items.find(
-                (task) =>
-                  task.status === "error" &&
-                  task.error?.includes("超时") &&
-                  task.conversation_id &&
-                  !retryingTaskIdsRef.has(task.id),
-              );
-              if (timeoutTask && timeoutTask.conversation_id) {
-                retryingTaskIdsRef.add(timeoutTask.id);
-                setTimeoutRetry({
-                  conversationId: timeoutTask.conversation_id,
-                  taskId: timeoutTask.id,
-                  taskError: timeoutTask.error || "生图超时",
-                });
-                // 应用超时错误到对应图片，显示继续等待按钮
-                await applyTasks([timeoutTask]);
-              } else {
-                await applyTasks(taskList.items);
-              }
+              await applyTasks(taskList.items);
             }
             if (taskList.missing_ids.length > 0 && latestTurn) {
               const missingImages = latestTurn.images.filter(
@@ -1410,71 +1388,42 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     [runConversationQueue],
   );
 
-  const handleTimeoutRetryContinue = useCallback(async () => {
-    if (!timeoutRetry) return;
-    const { conversationId, taskId } = timeoutRetry;
+  const handleTimeoutRetryContinue = useCallback(async (taskId: string) => {
+    const conversation = conversationsRef.current.find((item) =>
+      item.turns.some((turn) => turn.images.some((image) => (image.taskId || image.id) === taskId)),
+    );
+    if (!conversation) {
+      toast.error("未找到对应的图片任务");
+      return;
+    }
     try {
-      await resumeImagePoll(taskId, imageTimeoutRetrySecs);
-      // 将对应图片的状态重置为 loading，并清除错误
-      void updateConversation(conversationId, (current) => {
-        const conversation = current ?? conversationsRef.current.find((c) => c.id === conversationId);
-        if (!conversation) return current!;
+      const resumed = await resumeImagePoll(taskId, imageTimeoutRetrySecs);
+      await updateConversation(conversation.id, (current) => {
+        const value = current ?? conversation;
         return {
-          ...conversation,
+          ...value,
           updatedAt: new Date().toISOString(),
-          turns: conversation.turns.map((turn) => {
-            const hasLoading = turn.images.some((image) => image.taskId === taskId);
-            if (!hasLoading) return turn;
-            return {
-              ...turn,
-              status: "generating" as const,
-              error: undefined,
-              images: turn.images.map((image) =>
-                image.taskId === taskId
-                  ? { ...image, status: "loading" as const, error: undefined, taskStatus: "running" as const, startTime: image.startTime || Date.now() }
-                  : image
-              ),
-            };
+          turns: value.turns.map((turn) => {
+            if (!turn.images.some((image) => (image.taskId || image.id) === taskId)) return turn;
+            const images = turn.images.map((image) =>
+              (image.taskId || image.id) === taskId
+                ? taskDataToStoredImage({ ...image, taskId, startTime: Date.now() }, resumed)
+                : image,
+            );
+            return { ...turn, ...deriveTurnStatus({ ...turn, images }), images };
           }),
         };
       });
-      // 清除重试状态
-      setTimeoutRetry(null);
-      toast.info(`已继续等待 ${imageTimeoutRetrySecs} 秒`);
+      if (resumed.status === "running" || resumed.status === "queued") {
+        void runConversationQueue(conversation.id);
+        toast.info(`已继续等待 ${imageTimeoutRetrySecs} 秒`);
+      } else if (resumed.status === "success") {
+        toast.success("已取回图片");
+      }
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "续轮询失败";
-      toast.error(msg);
-      setTimeoutRetry(null);
+      toast.error(err instanceof Error ? err.message : "续轮询失败");
     }
-  }, [timeoutRetry, updateConversation, imageTimeoutRetrySecs]);
-
-  const handleTimeoutRetryCancel = useCallback(() => {
-    if (!timeoutRetry) return;
-    const { conversationId: convId, taskId, taskError } = timeoutRetry;
-    // 将超时错误应用到对应图片
-    void updateConversation(convId, (current) => {
-      const conversation = current ?? conversationsRef.current.find((c) => c.id === convId);
-      if (!conversation) return current!;
-      return {
-        ...conversation,
-        updatedAt: new Date().toISOString(),
-        turns: conversation.turns.map((turn) => {
-          const hasLoading = turn.images.some((image) => image.status === "loading" && image.taskId === taskId);
-          if (!hasLoading) return turn;
-          return {
-            ...turn,
-            status: "error" as const,
-            error: taskError,
-            images: turn.images.map((image) =>
-              image.taskId === taskId ? { ...image, status: "error" as const, error: taskError } : image,
-            ),
-          };
-        }),
-      };
-    });
-    setTimeoutRetry(null);
-    toast.error(taskError);
-  }, [timeoutRetry, updateConversation]);
+  }, [imageTimeoutRetrySecs, runConversationQueue, updateConversation]);
 
   const handleDismissErrors = useCallback(
     async (conversationId: string, turnId: string) => {
