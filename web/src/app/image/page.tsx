@@ -170,6 +170,17 @@ function buildReferenceImageFromResult(image: StoredImage, fileName: string): St
   };
 }
 
+function previousSingleResult(conversation: ImageConversation | null): StoredImage | null {
+  for (const turn of [...(conversation?.turns || [])].reverse()) {
+    if (turn.resultsDeleted) continue;
+    // Do not guess which result to edit in a batch, or while a newer turn runs.
+    if (turn.images.some((image) => image.status === "loading")) return null;
+    const results = turn.images.filter((image) => image.status === "success" && (image.url || image.b64_json));
+    if (results.length > 0) return turn.images.length === 1 ? results[0] : null;
+  }
+  return null;
+}
+
 async function fetchImageAsFile(url: string, fileName: string) {
   const response = await fetch(url);
   if (!response.ok) {
@@ -456,6 +467,9 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const [referenceImageFiles, setReferenceImageFiles] = useState<File[]>([]);
   const [referenceImages, setReferenceImages] = useState<StoredReferenceImage[]>([]);
+  const [dismissedPreviousImage, setDismissedPreviousImage] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const submittingRef = useRef(false);
   const [conversations, setConversations] = useState<ImageConversation[]>([]);
   const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
   const [isLoadingHistory, setIsLoadingHistory] = useState(true);
@@ -478,6 +492,12 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     () => conversations.find((item) => item.id === selectedConversationId) ?? null,
     [conversations, selectedConversationId],
   );
+  const previousImage = previousSingleResult(selectedConversation);
+  const previousImageKey = previousImage ? `${selectedConversationId}:${previousImage.id}` : null;
+  const inheritedImage = referenceImages.length === 0 && previousImageKey !== dismissedPreviousImage ? previousImage : null;
+  const composerReferenceImages = inheritedImage
+    ? [{ name: "上一张结果图.png", dataUrl: inheritedImage.b64_json ? `data:image/png;base64,${inheritedImage.b64_json}` : inheritedImage.url! }]
+    : referenceImages;
   const activeTaskCount = useMemo(
     () =>
       conversations.reduce((sum, conversation) => {
@@ -1063,6 +1083,10 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   );
 
   const handleRemoveReferenceImage = useCallback((index: number) => {
+    if (inheritedImage) {
+      setDismissedPreviousImage(previousImageKey);
+      return;
+    }
     setReferenceImageFiles((prev) => {
       const next = prev.filter((_, currentIndex) => currentIndex !== index);
       if (next.length === 0 && fileInputRef.current) {
@@ -1071,7 +1095,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       return next;
     });
     setReferenceImages((prev) => prev.filter((_, currentIndex) => currentIndex !== index));
-  }, []);
+  }, [inheritedImage, previousImageKey]);
 
   const handleContinueEdit = useCallback(
     async (conversationId: string, image: StoredImage | StoredReferenceImage) => {
@@ -1467,67 +1491,83 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   }, [conversations, runConversationQueue]);
 
   const handleSubmit = async () => {
+    if (submittingRef.current) return;
     const prompt = imagePrompt.trim();
     if (!prompt) {
       toast.error("请输入提示词");
       return;
     }
 
-    const effectiveImageMode: ImageConversationMode = referenceImageFiles.length > 0 ? "edit" : "generate";
+    submittingRef.current = true;
+    setIsSubmitting(true);
+    try {
+      let submissionReferences = referenceImages;
+      if (inheritedImage) {
+        const source = await buildReferenceImageFromStoredImage(inheritedImage, "previous-result.png");
+        if (!source) throw new Error("读取上一张结果图失败，请重新上传参考图");
+        submissionReferences = [source.referenceImage];
+      }
+      const effectiveImageMode: ImageConversationMode = submissionReferences.length > 0 ? "edit" : "generate";
 
-    const targetConversation = selectedConversationId
-      ? conversationsRef.current.find((conversation) => conversation.id === selectedConversationId) ?? null
-      : null;
-    const now = new Date().toISOString();
-    const conversationId = targetConversation?.id ?? createId();
-    const turnId = createId();
-    const imageSize = `${imageWidth || 1024}x${imageHeight || 1024}`;
-    const draftTurn: ImageTurn = {
-      id: turnId,
-      prompt,
-      model: imageModel,
-      mode: effectiveImageMode,
-      referenceImages: effectiveImageMode === "edit" ? referenceImages : [],
-      count: parsedCount,
-      size: imageSize,
-      ratio: imageRatio,
-      tier: imageTier,
-      quality: imageQuality,
-      images: createLoadingImages(turnId, parsedCount),
-      createdAt: now,
-      status: "queued",
-    };
-
-    const baseConversation: ImageConversation = targetConversation
-      ? {
-          ...targetConversation,
-          updatedAt: now,
-          turns: [...targetConversation.turns, draftTurn],
-        }
-      : {
-          id: conversationId,
-          title: buildConversationTitle(prompt),
-          createdAt: now,
-          updatedAt: now,
-          turns: [draftTurn],
+      const targetConversation = selectedConversationId
+        ? conversationsRef.current.find((conversation) => conversation.id === selectedConversationId) ?? null
+        : null;
+      const now = new Date().toISOString();
+      const conversationId = targetConversation?.id ?? createId();
+      const turnId = createId();
+      const imageSize = `${imageWidth || 1024}x${imageHeight || 1024}`;
+      const draftTurn: ImageTurn = {
+        id: turnId,
+        prompt,
+        model: imageModel,
+        mode: effectiveImageMode,
+        referenceImages: submissionReferences,
+        count: parsedCount,
+        size: imageSize,
+        ratio: imageRatio,
+        tier: imageTier,
+        quality: imageQuality,
+        images: createLoadingImages(turnId, parsedCount),
+        createdAt: now,
+        status: "queued",
       };
 
-    shouldStickToBottomRef.current = true;
-    const btn = scrollToLatestBtnRef.current;
-    if (btn) btn.style.display = "none";
-    setSelectedConversationId(conversationId);
-    clearComposerInputs();
+      const baseConversation: ImageConversation = targetConversation
+        ? {
+            ...targetConversation,
+            updatedAt: now,
+            turns: [...targetConversation.turns, draftTurn],
+          }
+        : {
+            id: conversationId,
+            title: buildConversationTitle(prompt),
+            createdAt: now,
+            updatedAt: now,
+            turns: [draftTurn],
+        };
 
-    await persistConversation(baseConversation);
-    void runConversationQueue(conversationId);
+      shouldStickToBottomRef.current = true;
+      const btn = scrollToLatestBtnRef.current;
+      if (btn) btn.style.display = "none";
+      setSelectedConversationId(conversationId);
+      clearComposerInputs();
 
-    const targetStats = getImageConversationStats(baseConversation);
-    if (targetStats.running > 0 || targetStats.queued > 1) {
-      toast.success("已加入当前对话队列");
-    } else if (!targetConversation) {
-      toast.success("已创建新对话并开始处理");
-    } else {
-      toast.success("已发送到当前对话");
+      await persistConversation(baseConversation);
+      void runConversationQueue(conversationId);
+
+      const targetStats = getImageConversationStats(baseConversation);
+      if (targetStats.running > 0 || targetStats.queued > 1) {
+        toast.success("已加入当前对话队列");
+      } else if (!targetConversation) {
+        toast.success("已创建新对话并开始处理");
+      } else {
+        toast.success("已发送到当前对话");
+      }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "提交失败");
+    } finally {
+      submittingRef.current = false;
+      setIsSubmitting(false);
     }
   };
 
@@ -1653,7 +1693,11 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
             imageModels={imageModels}
             availableQuota={availableQuota}
             activeTaskCount={activeTaskCount}
-            referenceImages={referenceImages}
+            referenceImages={composerReferenceImages}
+            previousImageAvailable={Boolean(previousImage) && referenceImages.length === 0}
+            editingPreviousImage={Boolean(inheritedImage)}
+            onEditingPreviousImageChange={(edit) => setDismissedPreviousImage(edit ? null : previousImageKey)}
+            isSubmitting={isSubmitting}
             textareaRef={textareaRef}
             fileInputRef={fileInputRef}
             onPromptChange={setImagePrompt}

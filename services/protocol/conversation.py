@@ -14,7 +14,7 @@ import tiktoken
 from services.account_service import account_service
 from services.config import config
 from services.image_storage_service import image_storage_service
-from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
+from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, ImageTextResponseError, OpenAIBackendAPI
 from utils.helper import (
     IMAGE_MODELS,
     extract_image_from_message_content,
@@ -930,6 +930,8 @@ def stream_image_outputs(
         image_urls = backend.resolve_conversation_image_urls(
             conversation_id, file_ids, sediment_ids, poll_timeout_secs=poll_timeout,
         )
+    except ImageTextResponseError:
+        raise
     except (ImageContentPolicyError, ImagePollTimeoutError) as exc:
         # 当检测到文本回复时，task error 不应直接判定为内容策略违规，
         # 因为图片可能仍在后台异步生成中
@@ -1018,6 +1020,8 @@ def stream_image_outputs(
                     file_ids.extend(item for item in polled_file_ids if item and item not in file_ids)
                     sediment_ids.extend(item for item in polled_sediment_ids if item and item not in sediment_ids)
                     break  # 轮询成功，退出重试循环
+                except ImageTextResponseError:
+                    raise
                 except Exception as exc:
                     error_str = str(exc)
                     is_transient = (
@@ -1131,6 +1135,8 @@ def stream_image_outputs(
                 file_ids.extend(item for item in polled_file_ids if item and item not in file_ids)
                 sediment_ids.extend(item for item in polled_sediment_ids if item and item not in sediment_ids)
                 break  # 轮询成功，退出重试循环
+            except ImageTextResponseError:
+                raise
             except Exception as exc:
                 error_str = str(exc)
                 is_transient = (
@@ -1369,6 +1375,13 @@ def _generate_single_image(
                 })
                 raise
             raise
+        except ImageTextResponseError as exc:
+            account_service.mark_image_result(token, False)
+            raise ImageGenerationError(
+                str(exc), status_code=400, error_type="invalid_request_error",
+                code="image_generation_text_response", account_email=account_email,
+                conversation_id=exc.conversation_id,
+            ) from exc
         except ImageContentPolicyError as exc:
             account_service.mark_image_result(token, False)
             logger.warning({

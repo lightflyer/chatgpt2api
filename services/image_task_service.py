@@ -13,6 +13,7 @@ from services.config import DATA_DIR, config
 from services.account_service import account_service
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
+from services.openai_backend_api import ImageTextResponseError
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
 from utils.helper import UpstreamHTTPError
 
@@ -579,7 +580,10 @@ class ImageTaskService:
                 urls=_collect_image_urls(data),
             )
         except Exception as exc:
-            error_message = "超时任务补取失败：" + (str(exc) or "resume poll failed")
+            error_message = (
+                str(exc) if isinstance(exc, ImageTextResponseError)
+                else "超时任务补取失败：" + (str(exc) or "resume poll failed")
+            )
             duration_ms = int((time.time() - started) * 1000)
             self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[], duration_ms=duration_ms)
             self._log_call(

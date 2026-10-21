@@ -110,6 +110,17 @@ class ResumeTaskTests(unittest.TestCase):
         self.assertEqual(response['status'], 'running')
         thread.return_value.start.assert_called_once()
 
+    def test_terminal_text_on_resume_shows_the_reply_without_another_timeout_button(self):
+        self.backend._extract_image_tool_records.return_value = []
+        self.backend._poll_image_results.side_effect = backend_module.ImageTextResponseError(
+            '请上传需要修改的原图', 'original-conversation')
+        result = self.run_resume()
+        self.assertEqual(result['status'], 'error')
+        self.assertIn('请上传', result['error'])
+        self.assertNotIn('超时', result['error'])
+        self.backend.close.assert_called_once()
+        self.handler.assert_not_called()
+
     def test_empty_download_is_not_reported_as_success(self):
         self.backend.download_image_bytes.return_value = []
         result = self.run_resume()

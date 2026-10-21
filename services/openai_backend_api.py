@@ -138,6 +138,15 @@ class EditableFileExportResult:
     zip_path: Path
 
 
+class ImageTextResponseError(RuntimeError):
+    """A completed image request needs user input instead of more polling."""
+
+    def __init__(self, text: str, conversation_id: str = "") -> None:
+        self.response_text = text
+        self.conversation_id = conversation_id
+        super().__init__(f"ChatGPT 未生成图片，回复：{text}")
+
+
 class OpenAIBackendAPI:
     """ChatGPT Web 后端封装。
 
@@ -2107,6 +2116,71 @@ class OpenAIBackendAPI:
                  "sediment_ids": sediment_ids})
         return sorted(records, key=lambda item: item["create_time"])
 
+    @classmethod
+    def completed_image_text_response(cls, data: Dict[str, Any]) -> str:
+        """Read a final text answer on the active turn, without cancelling image tools.
+
+        Image tools can run for minutes after SSE closes. Only a finished answer
+        to the user with no image tool on this turn is a terminal text response.
+        Ignore previous turns and abandoned branches in the conversation graph.
+        """
+        mapping = data.get("mapping") or {}
+        current = data.get("current_node")
+        nodes = []
+        if current:
+            seen = set()
+            while current:
+                if current in seen:
+                    return ""
+                seen.add(current)
+                node = mapping.get(current)
+                if not isinstance(node, dict):
+                    return ""
+                nodes.append(node)
+                if ((node.get("message") or {}).get("author") or {}).get("role") == "user":
+                    break
+                current = node.get("parent")
+            nodes.reverse()
+        else:
+            # Some conversation snapshots omit current_node. Retain only the
+            # last turn in their chronological mapping order.
+            for node in mapping.values():
+                if not isinstance(node, dict):
+                    continue
+                if ((node.get("message") or {}).get("author") or {}).get("role") == "user":
+                    nodes = []
+                nodes.append(node)
+        messages = [node["message"] for node in nodes if isinstance(node.get("message"), dict)]
+        if not messages:
+            return ""
+        last = messages[-1]
+        content = last.get("content") or {}
+        if (
+            (last.get("author") or {}).get("role") != "assistant"
+            or last.get("recipient") not in (None, "", "all")
+            or last.get("status") != "finished_successfully"
+            or last.get("end_turn") is not True
+            or last.get("channel") not in (None, "", "final")
+            or content.get("content_type") != "text"
+        ):
+            return ""
+        for message in messages:
+            author = message.get("author") or {}
+            metadata = message.get("metadata") or {}
+            recipient = str(message.get("recipient") or "").lower()
+            if (
+                metadata.get("async_task_type") == "image_gen"
+                or "image" in recipient
+                or (author.get("role") == "tool" and "image" in str(author.get("name") or "").lower())
+                or (cls._has_image_asset_pointer(message.get("content")) and author.get("role") != "user")
+            ):
+                return ""
+        text = "\n".join(part for part in content.get("parts", []) if isinstance(part, str)).strip()
+        # Tool parameters can appear as plain text while a job starts remotely.
+        if "referenced_image_ids" in text or re.search(r'"(?:size|prompt)"\s*:', text):
+            return ""
+        return text[:4000]
+
     @staticmethod
     def _find_content_policy_error_in_conversation(data: Dict[str, Any]) -> str:
         """从对话文档中查找内容政策违规错误消息。
@@ -2223,6 +2297,7 @@ class OpenAIBackendAPI:
             # 在每次轮询时，检查 /backend-api/tasks/ 是否有错误（仅记录，不中断）
             # 内容政策违规检测通过对话文本进行（在 _find_content_policy_error_in_conversation 中）
             last_task_error = ""
+            tasks = []
             try:
                 tasks = self._query_backend_tasks(conversation_id=conversation_id, timeout_secs=5.0)
                 for task in tasks:
@@ -2280,6 +2355,11 @@ class OpenAIBackendAPI:
                         "error_msg": policy_msg[:200],
                     })
                     raise ImageContentPolicyError(policy_msg)
+
+                text_reply = self.completed_image_text_response(conversation)
+                if text_reply and not tasks:
+                    logger.info({"event": "image_poll_completed_text", "conversation_id": conversation_id})
+                    raise ImageTextResponseError(text_reply, conversation_id)
 
             logger.debug({"event": "image_poll_check", "conversation_id": conversation_id, "attempt": attempt,
                           "file_ids": file_ids, "sediment_ids": sediment_ids})

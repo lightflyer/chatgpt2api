@@ -23,6 +23,10 @@ type ImageComposerProps = {
   availableQuota: string;
   activeTaskCount: number;
   referenceImages: Array<{ name: string; dataUrl: string }>;
+  previousImageAvailable: boolean;
+  editingPreviousImage: boolean;
+  onEditingPreviousImageChange: (edit: boolean) => void;
+  isSubmitting: boolean;
   textareaRef: RefObject<HTMLTextAreaElement | null>;
   fileInputRef: RefObject<HTMLInputElement | null>;
   onPromptChange: (value: string) => void;
@@ -93,6 +97,10 @@ export function ImageComposer({
   availableQuota,
   activeTaskCount,
   referenceImages,
+  previousImageAvailable,
+  editingPreviousImage,
+  onEditingPreviousImageChange,
+  isSubmitting,
   textareaRef,
   fileInputRef,
   onPromptChange,
@@ -219,6 +227,21 @@ export function ImageComposer({
           }}
         />
 
+        {previousImageAvailable ? (
+          <div className="mb-2 flex items-center gap-2 px-1 text-xs text-stone-500">
+            <button type="button" aria-pressed={editingPreviousImage} disabled={isSubmitting}
+              className={cn("rounded-full px-3 py-1.5", editingPreviousImage && "bg-stone-900 text-white")}
+              onClick={() => onEditingPreviousImageChange(true)}>编辑上一张</button>
+            <button type="button" aria-pressed={!editingPreviousImage} disabled={isSubmitting}
+              className={cn("rounded-full px-3 py-1.5", !editingPreviousImage && "bg-stone-900 text-white")}
+              onClick={() => onEditingPreviousImageChange(false)}>独立生图</button>
+          </div>
+        ) : null}
+        <p className="mb-2 px-1 text-xs text-stone-500">
+          {referenceImages.length > 0
+            ? "将上传下方参考图进行编辑"
+            : "修改已有图片时，请上传原图或点击目标图片的「加入编辑」"}
+        </p>
         {referenceImages.length > 0 ? (
           <div className="mb-2 flex gap-2 overflow-x-auto px-1 pb-1 sm:mb-3 sm:flex-wrap sm:overflow-visible sm:pb-0">
             {referenceImages.map((image, index) => (
@@ -280,6 +303,7 @@ export function ImageComposer({
             <Textarea
               ref={textareaRef}
               value={prompt}
+              disabled={isSubmitting}
               onChange={(event) => onPromptChange(event.target.value)}
               onPaste={handleTextareaPaste}
               placeholder={
@@ -526,7 +550,7 @@ export function ImageComposer({
                 <button
                   type="button"
                   onClick={() => void onSubmit()}
-                  disabled={!prompt.trim()}
+                  disabled={!prompt.trim() || isSubmitting}
                   className="inline-flex size-10 shrink-0 items-center justify-center rounded-full bg-stone-950 text-white transition hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300 sm:size-11"
                   aria-label={referenceImages.length > 0 ? "编辑图片" : "生成图片"}
                 >
